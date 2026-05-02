@@ -1,0 +1,12 @@
+services:
+  adhan:
+    build: .
+    image: adhan:latest
+    container_name: adhan
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+    environment:
+      - NODE_ENV=production
+      - PORT=80
+      - HOSTNAME=0.0.0.0

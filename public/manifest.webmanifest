@@ -1,0 +1,10 @@
+{
+  "name": "Adhan — Prayer Times",
+  "short_name": "Adhan",
+  "description": "Prayer times, sunrise, and qibla compass.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070b1a",
+  "theme_color": "#070b1a",
+  "icons": []
+}
