@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "./I18nProvider";
 
 type Props = { degrees: number; location: string };
@@ -18,12 +18,42 @@ type CompassStatus =
   | "denied"
   | "unsupported";
 
+const SMOOTH_ALPHA = 0.15;
+
+function getScreenAngle() {
+  if (typeof window === "undefined") return 0;
+  const so = window.screen?.orientation;
+  if (so && typeof so.angle === "number") return so.angle;
+  const legacy = (window as unknown as { orientation?: number }).orientation;
+  return typeof legacy === "number" ? legacy : 0;
+}
+
+function shortestDelta(from: number, to: number) {
+  let d = (to - from) % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+function rawHeadingFromEvent(e: DeviceOrientationEvent): number | null {
+  const webkit = (e as DeviceOrientationEvent & { webkitCompassHeading?: number })
+    .webkitCompassHeading;
+  if (typeof webkit === "number" && !Number.isNaN(webkit)) {
+    return webkit;
+  }
+  if (e.alpha != null) {
+    const screen = getScreenAngle();
+    return (((360 - e.alpha + screen) % 360) + 360) % 360;
+  }
+  return null;
+}
+
 export default function QiblaCompass({ degrees, location }: Props) {
   const { t, locale } = useI18n();
-  const [heading, setHeading] = useState<number | null>(null);
+  // Continuous (unwrapped) heading. Lets CSS rotate smoothly across the 0/360 boundary.
+  const [headingCont, setHeadingCont] = useState<number | null>(null);
   const [status, setStatus] = useState<CompassStatus>("idle");
-  const attachedRef = useRef(false);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const enableRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -38,70 +68,114 @@ export default function QiblaCompass({ degrees, location }: Props) {
       setStatus("needs-secure-context");
       return;
     }
+
+    let attached = false;
+    let smoothedCont: number | null = null;
+    let rafId: number | null = null;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let probeTimer: ReturnType<typeof setTimeout> | null = null;
+    let source: "absolute" | "relative" | null = null;
+
+    const commit = () => {
+      rafId = null;
+      if (smoothedCont != null) {
+        setHeadingCont(smoothedCont);
+        setStatus("active");
+      }
+    };
+
+    const process = (e: DeviceOrientationEvent) => {
+      const raw = rawHeadingFromEvent(e);
+      if (raw == null) return;
+      if (smoothedCont == null) {
+        smoothedCont = raw;
+      } else {
+        const cur = ((smoothedCont % 360) + 360) % 360;
+        const delta = shortestDelta(cur, raw);
+        smoothedCont = smoothedCont + SMOOTH_ALPHA * delta;
+      }
+      if (rafId == null) rafId = requestAnimationFrame(commit);
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    const handleAbsolute = (e: Event) => {
+      const ev = e as DeviceOrientationEvent;
+      if (source !== "absolute") {
+        source = "absolute";
+        // Absolute is authoritative; drop relative so the two don't fight.
+        window.removeEventListener("deviceorientation", handleRelative, true);
+        if (probeTimer) {
+          clearTimeout(probeTimer);
+          probeTimer = null;
+        }
+      }
+      process(ev);
+    };
+
+    const handleRelative = (e: Event) => {
+      const ev = e as DeviceOrientationEvent;
+      if (source === "absolute") return;
+      if (source == null) source = ev.absolute ? "absolute" : "relative";
+      process(ev);
+    };
+
+    const attach = () => {
+      if (attached) return;
+      attached = true;
+      setStatus("listening");
+      window.addEventListener("deviceorientationabsolute", handleAbsolute, true);
+      // Fall back to relative orientation only if absolute never fires.
+      probeTimer = setTimeout(() => {
+        probeTimer = null;
+        if (source == null) {
+          window.addEventListener("deviceorientation", handleRelative, true);
+        }
+      }, 600);
+      fallbackTimer = setTimeout(() => {
+        if (smoothedCont == null) setStatus("unsupported");
+      }, 5000);
+    };
+
+    const detach = () => {
+      attached = false;
+      window.removeEventListener("deviceorientationabsolute", handleAbsolute, true);
+      window.removeEventListener("deviceorientation", handleRelative, true);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (probeTimer) clearTimeout(probeTimer);
+      if (rafId != null) cancelAnimationFrame(rafId);
+    };
+
     const ctor = window.DeviceOrientationEvent as DeviceOrientationEventConstructorWithPermission;
     if (typeof ctor.requestPermission === "function") {
       setStatus("needs-permission");
+      enableRef.current = async () => {
+        try {
+          const r = await ctor.requestPermission!();
+          if (r === "granted") attach();
+          else setStatus("denied");
+        } catch {
+          setStatus("denied");
+        }
+      };
     } else {
+      enableRef.current = () => attach();
       attach();
     }
+
     return detach;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function handler(e: DeviceOrientationEvent) {
-    const webkit = (e as DeviceOrientationEvent & { webkitCompassHeading?: number })
-      .webkitCompassHeading;
-    let h: number | null = null;
-    if (typeof webkit === "number") {
-      h = webkit;
-    } else if (e.alpha != null) {
-      h = 360 - e.alpha;
-    }
-    if (h != null) {
-      setHeading(h);
-      setStatus("active");
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
-    }
-  }
+  const enableCompass = useCallback(() => enableRef.current(), []);
 
-  function attach() {
-    if (attachedRef.current) return;
-    attachedRef.current = true;
-    setStatus("listening");
-    window.addEventListener("deviceorientationabsolute", handler as EventListener, true);
-    window.addEventListener("deviceorientation", handler as EventListener, true);
-    timeoutRef.current = setTimeout(() => {
-      if (heading == null) setStatus("unsupported");
-    }, 4000);
-  }
-
-  function detach() {
-    attachedRef.current = false;
-    window.removeEventListener("deviceorientationabsolute", handler as EventListener, true);
-    window.removeEventListener("deviceorientation", handler as EventListener, true);
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-  }
-
-  async function enableCompass() {
-    const ctor = window.DeviceOrientationEvent as DeviceOrientationEventConstructorWithPermission;
-    if (typeof ctor.requestPermission === "function") {
-      try {
-        const result = await ctor.requestPermission();
-        if (result === "granted") attach();
-        else setStatus("denied");
-      } catch {
-        setStatus("denied");
-      }
-    } else {
-      attach();
-    }
-  }
-
-  const arrowRotation = heading != null ? degrees - heading : degrees;
-  const aligned = heading != null && Math.abs(((degrees - heading + 540) % 360) - 180) < 5;
+  const headingDisplay =
+    headingCont != null ? ((headingCont % 360) + 360) % 360 : null;
+  const arrowRotation = headingCont != null ? degrees - headingCont : degrees;
+  const cardinalRotation = headingCont != null ? -headingCont : 0;
+  const aligned =
+    headingDisplay != null && Math.abs(shortestDelta(headingDisplay, degrees)) < 5;
   const formattedDeg = degrees.toLocaleString(locale, { maximumFractionDigits: 1 });
 
   return (
@@ -118,8 +192,8 @@ export default function QiblaCompass({ degrees, location }: Props) {
         <Markings />
 
         <div
-          className="absolute inset-0 transition-transform duration-300 ease-out"
-          style={{ transform: `rotate(${heading != null ? -heading : 0}deg)` }}
+          className="absolute inset-0 transition-transform duration-100 ease-out will-change-transform"
+          style={{ transform: `rotate(${cardinalRotation}deg)` }}
         >
           <div className="absolute top-2 left-1/2 -translate-x-1/2 text-xs font-semibold text-white/70">
             N
@@ -130,7 +204,7 @@ export default function QiblaCompass({ degrees, location }: Props) {
         </div>
 
         <div
-          className="absolute inset-0 transition-transform duration-300 ease-out"
+          className="absolute inset-0 transition-transform duration-100 ease-out will-change-transform"
           style={{ transform: `rotate(${arrowRotation}deg)` }}
         >
           <div className="absolute left-1/2 -translate-x-1/2 top-4 flex flex-col items-center gap-1">
